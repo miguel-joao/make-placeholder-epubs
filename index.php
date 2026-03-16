@@ -72,13 +72,19 @@ function sanitize_filename_part($string) {
 }
 
 /**
- * Executes a cURL request to a given URL and returns the response body.
+ * Executes a cURL request to a given URL and returns the response body and final URL.
+ * @param string $url The URL to fetch
+ * @param array $headers Optional HTTP headers
+ * @param string $post_fields Optional POST data
+ * @return array|null Array with 'content' and 'final_url' keys, or null on failure
  */
 function fetch_url($url, $headers = [], $post_fields = null) {
     log_message("Fetching URL: $url" . ($post_fields ? " (POST)" : ""));
     $ch = curl_init();
     curl_setopt($ch, CURLOPT_URL, $url);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, 1);
+    curl_setopt($ch, CURLOPT_FOLLOWLOCATION, 1); // Follow redirects
+    curl_setopt($ch, CURLOPT_MAXREDIRS, 5); // Allow up to 5 redirects
     
     if ($post_fields) {
         curl_setopt($ch, CURLOPT_POST, 1);
@@ -94,6 +100,7 @@ function fetch_url($url, $headers = [], $post_fields = null) {
     
     $response = curl_exec($ch);
     $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    $final_url = curl_getinfo($ch, CURLINFO_EFFECTIVE_URL);
     $error = curl_error($ch);
     curl_close($ch);
 
@@ -102,8 +109,11 @@ function fetch_url($url, $headers = [], $post_fields = null) {
         return null;
     }
     
-    log_message("Successfully fetched URL, HTTP code: $http_code");
-    return $response;
+    log_message("Successfully fetched URL, HTTP code: $http_code, Final URL: $final_url");
+    return [
+        'content' => $response,
+        'final_url' => $final_url
+    ];
 }
 
 
@@ -119,10 +129,10 @@ function get_hardcover_metadata($identifier) {
     $variables = ['identifier' => $identifier];
     $payload = json_encode(['query' => $query, 'variables' => $variables]);
     $headers = ['Content-Type: application/json', 'Authorization: ' . HARDCOVER_BEARER_TOKEN];
-    $data = fetch_url(HARDCOVER_GRAPHQL_ENDPOINT, $headers, $payload);
+    $response = fetch_url(HARDCOVER_GRAPHQL_ENDPOINT, $headers, $payload);
 
-    if ($data) {
-        $json = json_decode($data, true);
+    if ($response) {
+        $json = json_decode($response['content'], true);
 
         if (isset($json['errors'])) {
             log_message("Hardcover GraphQL Error: " . print_r($json['errors'], true), 'WARNING');
@@ -160,10 +170,10 @@ function get_hardcover_metadata($identifier) {
 function get_google_books_metadata($isbn) {
     log_message("Attempting to get metadata from Google Books for ISBN: $isbn");
     $url = "https://www.googleapis.com/books/v1/volumes?q=isbn:$isbn";
-    $data = fetch_url($url);
+    $response = fetch_url($url);
 
-    if ($data) {
-        $json = json_decode($data, true);
+    if ($response) {
+        $json = json_decode($response['content'], true);
         if (isset($json['totalItems']) && $json['totalItems'] > 0) {
             $item = $json['items'][0]['volumeInfo'];
             log_message("Google Books success: Found book titled '{$item['title']}'");
@@ -185,6 +195,210 @@ function get_google_books_metadata($isbn) {
     return null;
 }
 
+// --- Metadata Retrieval Functions (GoodReads) ---
+
+/**
+ * Searches GoodReads by ISBN and extracts metadata
+ */
+function get_goodreads_metadata_by_isbn($isbn) {
+    log_message("Attempting to get metadata from GoodReads for ISBN: $isbn");
+    
+    $url = "https://www.goodreads.com/book/isbn/" . urlencode($isbn);
+    $headers = [
+        'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+    ];
+    
+    $response = fetch_url($url, $headers);
+    if (!$response) {
+        log_message("GoodReads: Failed to fetch ISBN page.", 'WARNING');
+        return null;
+    }
+    
+    // Extract book ID from the redirect URL (after 301 redirect from ISBN lookup)
+    if (preg_match('/\/book\/show\/(\d+)/', $response['final_url'], $id_matches)) {
+        $book_id = $id_matches[1];
+        log_message("GoodReads: Extracted book ID $book_id from redirect URL: {$response['final_url']}");
+        return get_goodreads_metadata_by_id($book_id);
+    }
+    
+    // Fallback: try to extract from og:url meta tag in the content
+    if (preg_match('/<meta\s+property="og:url"\s+content="([^"]+)"/', $response['content'], $matches)) {
+        $og_url = $matches[1];
+        if (preg_match('/\/book\/show\/(\d+)/', $og_url, $id_matches)) {
+            $book_id = $id_matches[1];
+            return get_goodreads_metadata_by_id($book_id);
+        }
+    }
+    
+    log_message("GoodReads: Could not extract book ID from ISBN page.", 'WARNING');
+    return null;
+}
+
+/**
+ * Searches GoodReads by title and author
+ */
+function get_goodreads_metadata_by_title_author($title, $author) {
+    log_message("Attempting to get metadata from GoodReads for title: $title, author: $author");
+    
+    $search_term = urlencode($title . ' ' . $author);
+    $url = "https://www.goodreads.com/search?q=" . $search_term;
+    
+    $headers = [
+        'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+    ];
+    
+    $response = fetch_url($url, $headers);
+    if (!$response) {
+        log_message("GoodReads: Failed to fetch search results.", 'WARNING');
+        return null;
+    }
+    
+    // Parse the search results table
+    $results = [];
+    if (preg_match_all('/<tr[^>]*itemtype="http:\/\/schema\.org\/Book"[^>]*>(.*?)<\/tr>/s', $response['content'], $matches)) {
+        foreach (array_slice($matches[1], 0, 3) as $book_row) {
+            // Extract book ID from href
+            if (preg_match('/href="\/book\/show\/(\d+)/', $book_row, $id_match)) {
+                $book_id = $id_match[1];
+                $metadata = get_goodreads_metadata_by_id($book_id);
+                if ($metadata) {
+                    $results[] = $metadata;
+                }
+            }
+        }
+    }
+    
+    if (count($results) > 0) {
+        log_message("GoodReads success: Found " . count($results) . " book(s).");
+        return $results;
+    }
+    
+    log_message("GoodReads: No books found for search term.", 'WARNING');
+    return null;
+}
+
+/**
+ * Fetches and parses a single book by ID
+ */
+function get_goodreads_metadata_by_id($book_id) {
+    $url = "https://www.goodreads.com/book/show/" . $book_id;
+    
+    $headers = [
+        'User-Agent: Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36'
+    ];
+    
+    $response = fetch_url($url, $headers);
+    if (!$response) {
+        log_message("GoodReads: Failed to fetch book page for ID: $book_id", 'WARNING');
+        return null;
+    }
+    
+    // Extract the Apollo State JSON from the __NEXT_DATA__ script tag
+    if (!preg_match('/<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)<\/script>/s', $response['content'], $matches)) {
+        log_message("GoodReads: Could not find __NEXT_DATA__ script for ID: $book_id", 'WARNING');
+        return null;
+    }
+    
+    $json_str = $matches[1];
+    $json = json_decode($json_str, true);
+    
+    if (!$json) {
+        log_message("GoodReads: Failed to parse JSON for ID: $book_id", 'WARNING');
+        return null;
+    }
+    
+    // Navigate to Apollo State
+    $apollo_state = $json['props']['pageProps']['apolloState'] ?? null;
+    if (!$apollo_state) {
+        log_message("GoodReads: No Apollo State found for ID: $book_id", 'WARNING');
+        return null;
+    }
+    
+    // Extract book details
+    $book_data = null;
+    $author_name = 'Unknown Author';
+    $publisher = '';
+    $published_date = '';
+    $isbn = 'N/A';
+    $description = '';
+    $cover_url = null;
+    $title = 'Unknown Title';
+    $subtitle = '';
+    
+    // Find the Book object in Apollo State (prefer the one with actual book data)
+    foreach ($apollo_state as $key => $obj) {
+        if (is_array($obj) && strpos($key, 'Book:kca:') !== false) {
+            // Check if this Book object has meaningful data (has a title)
+            $candidate_title = $obj['title'] ?? null;
+            if ($candidate_title && !empty(trim($candidate_title))) {
+                $book_data = $obj;
+                break;
+            }
+        }
+    }
+    
+    // Fallback: if no book with title found, just use the first one
+    if (!$book_data) {
+        foreach ($apollo_state as $key => $obj) {
+            if (is_array($obj) && strpos($key, 'Book:kca:') !== false) {
+                $book_data = $obj;
+                break;
+            }
+        }
+    }
+    
+    if ($book_data) {
+        $title = $book_data['title'] ?? 'Unknown Title';
+        
+        // Parse title and subtitle (separated by colon)
+        if (preg_match('/^(.+?):\s*(.+)$/', $title, $title_match)) {
+            $title = trim($title_match[1]);
+            $subtitle = trim($title_match[2]);
+        }
+        
+        $description = $book_data['description'] ?? '';
+        $cover_url = $book_data['imageUrl'] ?? null;
+        
+        // Extract details
+        $details = $book_data['details'] ?? [];
+        if ($details) {
+            $publisher = $details['publisher'] ?? '';
+            $isbn = $details['isbn13'] ?? $details['isbn'] ?? 'N/A';
+            
+            // Parse publication date from timestamp
+            if (isset($details['publicationTime']) && is_numeric($details['publicationTime'])) {
+                $published_date = date('Y-m-d', intval($details['publicationTime']) / 1000);
+            } else {
+                $published_date = $details['publicationDate'] ?? '';
+            }
+        }
+    }
+    
+    // Find the Contributor (Author) object
+    foreach ($apollo_state as $key => $obj) {
+        if (is_array($obj) && strpos($key, 'Contributor:kca') !== false) {
+            if (isset($obj['name'])) {
+                $author_name = $obj['name'];
+                break;
+            }
+        }
+    }
+    
+    log_message("GoodReads success: Found book titled '$title' by '$author_name'");
+    
+    return [
+        'title' => $title,
+        'subtitle' => $subtitle,
+        'author' => $author_name,
+        'description' => $description,
+        'publisher' => $publisher,
+        'publishedDate' => $published_date,
+        'cover_url' => $cover_url,
+        'isbn' => $isbn,
+        'source' => 'GoodReads'
+    ];
+}
+
 // --- Metadata Retrieval Functions (Open Library) ---
 
 function get_open_library_metadata_by_title_author($title, $author) {
@@ -192,10 +406,10 @@ function get_open_library_metadata_by_title_author($title, $author) {
     $title_query = urlencode($title);
     $author_query = urlencode($author);
     $url = "https://openlibrary.org/search.json?title={$title_query}&author={$author_query}";
-    $data = fetch_url($url);
+    $response = fetch_url($url);
 
-    if ($data) {
-        $json = json_decode($data, true);
+    if ($response) {
+        $json = json_decode($response['content'], true);
         if (isset($json['docs']) && count($json['docs']) > 0) {
             $results = [];
             foreach (array_slice($json['docs'], 0, 3) as $book) {
@@ -224,10 +438,10 @@ function get_open_library_metadata_by_title_author($title, $author) {
 function get_open_library_metadata($isbn) {
     log_message("Attempting to get metadata from Open Library for ISBN: $isbn");
     $url = "https://openlibrary.org/api/books?bibkeys=ISBN:$isbn&jscmd=data&format=json";
-    $data = fetch_url($url);
+    $response = fetch_url($url);
 
-    if ($data) {
-        $json = json_decode($data, true);
+    if ($response) {
+        $json = json_decode($response['content'], true);
         $key = "ISBN:$isbn";
         
         if (isset($json[$key])) {
@@ -295,10 +509,10 @@ function get_gemini_cover_suggestion($base64_image_data) {
         ]
     ]);
     $headers = ['Content-Type: application/json'];
-    $response = fetch_url($url, $headers, $payload);
+    $fetch_result = fetch_url($url, $headers, $payload);
 
-    if ($response) {
-        $json = json_decode($response, true);
+    if ($fetch_result) {
+        $json = json_decode($fetch_result['content'], true);
 
         if (isset($json['candidates'][0]['content']['parts'][0]['text'])) {
             $text = $json['candidates'][0]['content']['parts'][0]['text'];
@@ -319,18 +533,21 @@ function get_gemini_cover_suggestion($base64_image_data) {
 
 
 /**
- * Consolidates metadata from Hardcover, Google Books, and Open Library.
+ * Consolidates metadata from GoodReads, Hardcover, Google Books, and Open Library.
  */
 function get_book_metadata($identifier, $type = 'ISBN', $author = null) {
     // Determine which API to call based on the search type
     if ($type === 'TITLE_AUTHOR') {
         $title = $identifier;
-        // Manual search now uses Hardcover and Open Library
+        // Manual search now uses GoodReads, Hardcover and Open Library (GoodReads first for better quality)
+        $goodreads_data = get_goodreads_metadata_by_title_author($title, $author);
+        $goodreads_data = !empty($goodreads_data) ? [$goodreads_data[0]] : [];
         $hardcover_data = get_hardcover_metadata("$title $author");
         $hardcover_data = !empty($hardcover_data) ? [$hardcover_data[0]] : [];
         $open_library_data = get_open_library_metadata_by_title_author($title, $author);
 
         $all_results = array_merge(
+            !empty($goodreads_data) ? $goodreads_data : [],
             !empty($open_library_data) ? $open_library_data : [],
             !empty($hardcover_data) ? $hardcover_data : []
         );
@@ -345,6 +562,7 @@ function get_book_metadata($identifier, $type = 'ISBN', $author = null) {
         }
 
     } else { // ISBN search
+        $goodreads_data = get_goodreads_metadata_by_isbn($identifier);
         $hardcover_data = get_hardcover_metadata($identifier);
         $hardcover_data = !empty($hardcover_data) ? $hardcover_data[0] : $hardcover_data; // convert array to single element for isbn search
         $google_data = get_google_books_metadata($identifier);
@@ -353,7 +571,7 @@ function get_book_metadata($identifier, $type = 'ISBN', $author = null) {
         $metadata = [
             'isbn' => $identifier,
             'title' => 'Title Not Found',
-            'subtitle' => '',
+            'subtitle' => 'N/A',
             'author' => 'Author Not Found',
             'description' => 'No description available.',
             'publisher' => 'Publisher Not Found',
@@ -362,11 +580,11 @@ function get_book_metadata($identifier, $type = 'ISBN', $author = null) {
             'sources' => []
         ];
    
-        $sources = array_values(array_filter([$hardcover_data, $open_library_data, $google_data], 
+        $sources = array_values(array_filter([$goodreads_data, $open_library_data, $google_data, $hardcover_data], 
             fn($data) => !empty($data)
         ));
    
-        // Prioritized consolidation: Open Library > Google
+        // Prioritized consolidation: GoodReads > Open Library > Google > Hardcover
         foreach ($sources as $source) {
             if (!in_array($source['source'], $metadata['sources'])) {
                 $metadata['sources'][] = $source['source'];
@@ -388,8 +606,10 @@ function get_book_metadata($identifier, $type = 'ISBN', $author = null) {
             }
         }
 
-        // Final cover check
-        if ($open_library_data && isset($open_library_data['cover_url']) && $open_library_data['cover_url']) {
+        // Final cover check with priority: GoodReads > Open Library > Google > Hardcover
+        if ($goodreads_data && isset($goodreads_data['cover_url']) && $goodreads_data['cover_url']) {
+            $metadata['cover_url'] = $goodreads_data['cover_url'];
+        } elseif ($open_library_data && isset($open_library_data['cover_url']) && $open_library_data['cover_url']) {
             $metadata['cover_url'] = $open_library_data['cover_url'];
         } elseif ($google_data && isset($google_data['cover_url']) && $google_data['cover_url']) {
             $metadata['cover_url'] = $google_data['cover_url'];
@@ -414,7 +634,7 @@ function create_opf_content($metadata, $cover_mime = 'image/jpeg') {
     // HARDCODED COVER FILENAME AND MIME TYPE
     $cover_filename = 'cover.jpeg';
     $cover_mime = 'image/jpeg';
-    $modified_date = substr($metadata['publishedDate'], 0, 10) ?: '2024-01-01';
+    $modified_date = isset($metadata['publishedDate']) ? substr($metadata['publishedDate'], 0, 10) : '2024-01-01';
 
     $title = htmlspecialchars($metadata['title'] ?? 'Unknown Title', ENT_XML1, 'UTF-8');
     $subtitle = isset($metadata['subtitle']) && !empty($metadata['subtitle']) ? htmlspecialchars($metadata['subtitle'], ENT_XML1, 'UTF-8') : '';
@@ -596,11 +816,13 @@ EOT;
  */
 function download_file($url) { 
     log_message("Attempting to download file from: $url");
-    $content = fetch_url($url);
-    if (!$content) {
+    $response = fetch_url($url);
+    if (!$response) {
         log_message("Failed to download file from $url", 'ERROR');
         return null;
     }
+    
+    $content = $response['content'];
 
     // Determine MIME type
     $finfo = finfo_open(FILEINFO_MIME_TYPE);
@@ -861,7 +1083,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             }
 
             if (!$metadata) {
-                $message = "Could not find book using manual search (Hardcover API). Try a different combination.";
+                $message = "Could not find book using manual search (Goodreads, Hardcover nor OpenLibrary API). Try a different combination.";
                 log_message($message, 'ERROR');
                 echo json_encode(['success' => false, 'message' => $message]);
                 exit;
@@ -1061,7 +1283,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       📚 Book Barcode Scanner & EPUB Generator
     </h1>
     <p class="text-center text-gray-600 mb-8">
-      Scan a book's barcode (ISBN) to automatically fetch metadata from **Hardcover**, **Google Books**, and **Open Library**, and generate a starter EPUB file.
+      Scan a book's barcode (ISBN) to automatically fetch metadata from **Goodreads**, **Google Books**, **Open Library** and **Hardcover**, and generate a starter EPUB file.
     </p>
 
     <div id="scanner-container">
