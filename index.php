@@ -16,7 +16,7 @@ if (file_exists(__DIR__ . '/.env')) {
         if (strpos(trim($line), '#') === 0) continue;
         list($name, $value) = explode('=', $line, 2);
         $name = trim($name);
-        $value = trim($value);
+        $value = trim($value, '"\''); // Remove surrounding quotes
         if (!defined($name)) {
             define($name, $value);
         }
@@ -110,6 +110,10 @@ function fetch_url($url, $headers = [], $post_fields = null) {
 // --- Metadata Retrieval Functions (Hardcover - Priority Source) ---
 
 function get_hardcover_metadata($identifier) {
+    if (empty(HARDCOVER_BEARER_TOKEN)) {
+        log_message("Hardcover Bearer Token is not configured.", 'WARNING');
+        return null;
+    }
     log_message("Attempting to get metadata from Hardcover for $identifier");
     $query = 'query GetBookDetails($identifier: String!) { search(query: $identifier, query_type: "books") { results } }';
     $variables = ['identifier' => $identifier];
@@ -200,11 +204,11 @@ function get_open_library_metadata_by_title_author($title, $author) {
                     'title' => $book['title'] ?? 'Unknown Title',
                     'subtitle' => $book['subtitle'] ?? '',
                     'author' => implode(' & ', $book['author_name'] ?? ['Unknown Author']),
-                    'description' => $book['first_sentence'] ? $book['first_sentence'][0] : '',
-                    'publisher' => $book['publisher'] ? $book['publisher'][0] : '',
+                    'description' => (isset($book['first_sentence']) && $book['first_sentence']) ? $book['first_sentence'][0] : '',
+                    'publisher' => (isset($book['publisher']) && $book['publisher']) ? $book['publisher'][0] : '',
                     'publishedDate' => $book['first_publish_year'] ?? '',
                     'cover_url' => $cover_id ? "https://covers.openlibrary.org/b/id/{$cover_id}-L.jpg" : null,
-                    'isbn' => $book['isbn'] ? $book['isbn'][0] : 'N/A',
+                    'isbn' => (isset($book['isbn']) && $book['isbn'])  ? $book['isbn'][0] : 'N/A',
                     'source' => 'Open Library'
                 ];
             }
@@ -323,9 +327,13 @@ function get_book_metadata($identifier, $type = 'ISBN', $author = null) {
         $title = $identifier;
         // Manual search now uses Hardcover and Open Library
         $hardcover_data = get_hardcover_metadata("$title $author");
+        $hardcover_data = !empty($hardcover_data) ? [$hardcover_data[0]] : [];
         $open_library_data = get_open_library_metadata_by_title_author($title, $author);
 
-        $all_results = array_merge($open_library_data ?: [], $hardcover_data ?: []);
+        $all_results = array_merge(
+            !empty($open_library_data) ? $open_library_data : [],
+            !empty($hardcover_data) ? $hardcover_data : []
+        );
 
         if (count($all_results) > 1) {
             return ['multiple_options' => $all_results];
@@ -337,6 +345,8 @@ function get_book_metadata($identifier, $type = 'ISBN', $author = null) {
         }
 
     } else { // ISBN search
+        $hardcover_data = get_hardcover_metadata($identifier);
+        $hardcover_data = !empty($hardcover_data) ? $hardcover_data[0] : $hardcover_data; // convert array to single element for isbn search
         $google_data = get_google_books_metadata($identifier);
         $open_library_data = get_open_library_metadata($identifier);
 
@@ -351,9 +361,11 @@ function get_book_metadata($identifier, $type = 'ISBN', $author = null) {
             'cover_url' => null,
             'sources' => []
         ];
-
-        $sources = array_filter([$open_library_data, $google_data]);
-
+   
+        $sources = array_values(array_filter([$hardcover_data, $open_library_data, $google_data], 
+            fn($data) => !empty($data)
+        ));
+   
         // Prioritized consolidation: Open Library > Google
         foreach ($sources as $source) {
             if (!in_array($source['source'], $metadata['sources'])) {
@@ -361,6 +373,9 @@ function get_book_metadata($identifier, $type = 'ISBN', $author = null) {
             }
             // Overwrite if the current value is a placeholder or if the new value is better
             foreach ($source as $key => $value) {
+                if ($key === 'source') {
+                    continue;
+                }
                 if ($value && ($metadata[$key] === "Title Not Found" || 
                                $metadata[$key] === "Author Not Found" || 
                                $metadata[$key] === "No description available." ||
@@ -378,6 +393,8 @@ function get_book_metadata($identifier, $type = 'ISBN', $author = null) {
             $metadata['cover_url'] = $open_library_data['cover_url'];
         } elseif ($google_data && isset($google_data['cover_url']) && $google_data['cover_url']) {
             $metadata['cover_url'] = $google_data['cover_url'];
+        } elseif ($hardcover_data && isset($hardcover_data['cover_url']) && $hardcover_data['cover_url']) {
+            $metadata['cover_url'] = $hardcover_data['cover_url'];
         }
 
         $metadata['source'] = implode(', ', $metadata['sources']);
@@ -399,12 +416,12 @@ function create_opf_content($metadata, $cover_mime = 'image/jpeg') {
     $cover_mime = 'image/jpeg';
     $modified_date = substr($metadata['publishedDate'], 0, 10) ?: '2024-01-01';
 
-    $title = htmlspecialchars($metadata['title'], ENT_XML1, 'UTF-8');
+    $title = htmlspecialchars($metadata['title'] ?? 'Unknown Title', ENT_XML1, 'UTF-8');
     $subtitle = isset($metadata['subtitle']) && !empty($metadata['subtitle']) ? htmlspecialchars($metadata['subtitle'], ENT_XML1, 'UTF-8') : '';
-    $author = htmlspecialchars($metadata['author'], ENT_XML1, 'UTF-8');
-    $isbn = htmlspecialchars($metadata['isbn'], ENT_XML1, 'UTF-8');
-    $publisher = htmlspecialchars($metadata['publisher'], ENT_XML1, 'UTF-8');
-    $description = htmlspecialchars($metadata['description'], ENT_XML1, 'UTF-8');
+    $author = htmlspecialchars($metadata['author'] ?? 'Unknown Author', ENT_XML1, 'UTF-8');
+    $isbn = htmlspecialchars($metadata['isbn'] ?? 'N/A', ENT_XML1, 'UTF-8');
+    $publisher = htmlspecialchars($metadata['publisher'] ?? 'Unknown Publisher', ENT_XML1, 'UTF-8');
+    $description = htmlspecialchars($metadata['description'] ?? 'No description available.', ENT_XML1, 'UTF-8');
 
     $full_title = $title;
     if ($subtitle) {
@@ -825,8 +842,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     // --- ACTION 3: MANUAL SEARCH (Fallback) ---
     if ($action === 'manual_search') {
-        $title = trim(filter_var($input['title'] ?? '', FILTER_SANITIZE_STRING));
-        $author = trim(filter_var($input['author'] ?? '', FILTER_SANITIZE_STRING));
+        $title = trim(preg_replace('/<[^>]*>/', '', $input['title'] ?? ''));
+        $author = trim(preg_replace('/<[^>]*>/', '', $input['author'] ?? ''));        
 
         log_message("Received Manual Search request for: title='$title', author='$author'");
 
@@ -907,7 +924,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     // --- ACTION 1 (Default): INITIAL ISBN SEARCH ---
 
-    $isbn = trim(filter_var($input['isbn'] ?? '', FILTER_SANITIZE_STRING));
+    $isbn = trim(htmlspecialchars($input['isbn'] ?? '', ENT_QUOTES, 'UTF-8'));
 
     try {
         if (!empty($isbn)) {
@@ -1066,6 +1083,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 class="bg-yellow-500 text-white font-semibold py-3 px-6 rounded-lg hover:bg-yellow-600 transition duration-150 ease-in-out shadow-md shadow-yellow-300">
             Manual Lookup
         </button>
+        <button id="main-manual-entry-button" 
+                class="bg-green-600 text-white font-semibold py-3 px-6 rounded-lg hover:bg-green-700 transition duration-150 ease-in-out shadow-md shadow-green-300">
+            Manual Entry
+        </button>
+    </div>
+
+    <div class="mt-4 grid grid-cols-1">
         <button id="main-scan-cover-button" 
                 class="bg-purple-600 text-white font-semibold py-3 px-6 rounded-lg hover:bg-purple-700 transition duration-150 ease-in-out shadow-md shadow-purple-300">
             Scan Cover
@@ -1119,7 +1143,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                       class="bg-green-600 text-white font-semibold py-3 px-6 rounded-lg hover:bg-green-700 transition duration-150 ease-in-out shadow-md shadow-green-300">
                   Generate EPUB
               </button>
-              <button id="manual-entry-button"
+              <button id="confirmation-manual-entry-button"
                       class="bg-yellow-500 text-white font-semibold py-3 px-6 rounded-lg hover:bg-yellow-600 transition duration-150 ease-in-out shadow-md shadow-yellow-300">
                   Not right? Enter manually
               </button>
@@ -1232,6 +1256,56 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       </div>
   </div>
 
+  <div id="manual-entry-modal" 
+       class="fixed inset-0 bg-gray-900 bg-opacity-75 z-50 hidden items-center justify-center p-4">
+      <div class="bg-white p-8 rounded-xl shadow-2xl max-w-md w-full text-center transform transition-all duration-300 scale-95 opacity-0"
+           id="manual-entry-modal-content">
+          <h3 class="text-2xl font-bold text-gray-800 mb-4">
+              Manual Entry & EPUB Generation
+          </h3>
+          <p class="text-gray-700 mb-6">
+              Enter the book details below to generate an EPUB file.
+          </p>
+
+          <form id="manual-entry-form" class="space-y-4">
+              <div>
+                  <label for="entry-title" class="block text-left text-sm font-medium text-gray-700 mb-1">Title *</label>
+                  <input type="text" id="entry-title" required
+                         class="w-full p-3 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500">
+              </div>
+              <div>
+                  <label for="entry-author" class="block text-left text-sm font-medium text-gray-700 mb-1">Author *</label>
+                  <input type="text" id="entry-author" required
+                         class="w-full p-3 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500">
+              </div>
+              <div>
+                  <label for="entry-isbn" class="block text-left text-sm font-medium text-gray-700 mb-1">ISBN (Optional)</label>
+                  <input type="text" id="entry-isbn"
+                         class="w-full p-3 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500">
+              </div>
+              <div>
+                  <label for="entry-publisher" class="block text-left text-sm font-medium text-gray-700 mb-1">Publisher (Optional)</label>
+                  <input type="text" id="entry-publisher"
+                         class="w-full p-3 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500">
+              </div>
+              <div>
+                  <label for="entry-published-date" class="block text-left text-sm font-medium text-gray-700 mb-1">Publication Year (Optional)</label>
+                  <input type="text" id="entry-published-date"
+                         class="w-full p-3 border border-gray-300 rounded-lg focus:ring-blue-500 focus:border-blue-500" placeholder="e.g., 2023">
+              </div>
+              <button type="submit" id="entry-generate-button"
+                      class="w-full bg-green-600 text-white font-semibold py-3 px-6 rounded-lg hover:bg-green-700 transition duration-150 ease-in-out shadow-md shadow-green-300">
+                  Generate EPUB
+              </button>
+              <button type="button" id="entry-cancel-button" 
+                      class="w-full bg-gray-300 text-gray-800 font-semibold py-3 px-6 rounded-lg hover:bg-gray-400 transition duration-150 ease-in-out">
+                  Cancel
+              </button>
+          </form>
+          <div id="manual-entry-status" class="mt-4 text-sm text-red-600 font-medium"></div>
+      </div>
+  </div>
+
   <script>
     const ZXing = window.ZXing;
     const codeReader = new ZXing.BrowserMultiFormatReader();
@@ -1249,6 +1323,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     const toggleScanButton = document.getElementById('toggle-scan-button');
     const mainManualLookupButton = document.getElementById('main-manual-lookup-button');
     const mainScanCoverButton = document.getElementById('main-scan-cover-button');
+    const mainManualEntryButton = document.getElementById('main-manual-entry-button');
     
     // Modals and form elements
     const confirmationModal = document.getElementById('confirmation-modal');
@@ -1261,7 +1336,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     const selectionCancelButton = document.getElementById('selection-cancel-button');
     const confirmButton = document.getElementById('confirm-button');
     const cancelButton = document.getElementById('cancel-button');
-    const manualEntryButton = document.getElementById('manual-entry-button');
+    const confirmationManualEntryButton = document.getElementById('confirmation-manual-entry-button');
     const searchAgainButton = document.getElementById('search-again-button');
     const manualSearchForm = document.getElementById('manual-search-form');
     const manualCancelButton = document.getElementById('manual-cancel-button');
@@ -1276,6 +1351,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     const captureCoverButton = document.getElementById('capture-cover-button');
     const coverScanCancelButton = document.getElementById('cover-scan-cancel-button');
     const coverScanStatus = document.getElementById('cover-scan-status');
+
+    // Manual Entry Modal Elements
+    const manualEntryModal = document.getElementById('manual-entry-modal');
+    const manualEntryModalContent = document.getElementById('manual-entry-modal-content');
+    const manualEntryForm = document.getElementById('manual-entry-form');
+    const entryGenerateButton = document.getElementById('entry-generate-button');
+    const entryCancelButton = document.getElementById('entry-cancel-button');
+    const manualEntryStatus = document.getElementById('manual-entry-status');
 
     let currentFallbackISBN = ''; // Stores the ISBN that failed initial lookup
     let coverStream = null; // To hold the stream for the cover scanner
@@ -1505,13 +1588,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         const author = document.getElementById('search-author').value.trim();
         const isbn = document.getElementById('search-isbn').value.trim();
 
-        if (isbn) {
-            logResult(`Attempting manual search for ISBN: ${isbn}`);
-            hideModal(manualSearchModal, manualSearchModalContent, null);
-            await processISBNOnServer(isbn);
-        } else if (title && author) {
-            logResult(`Attempting manual search for: ${title} by ${author}`);
-            try {
+        try {
+            if (isbn) {
+                logResult(`Attempting manual search for ISBN: ${isbn}`);
+                hideModal(manualSearchModal, manualSearchModalContent, null);
+                await processISBNOnServer(isbn);
+            } else if (title && author) {
+                logResult(`Attempting manual search for: ${title} by ${author}`);
                 const response = await fetch('index.php', {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
@@ -1534,18 +1617,92 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
                 } else {
                     manualSearchStatus.textContent = data.message || 'Manual search failed. Try different keywords.';
                 }
-
-            } catch (error) {
-                console.error('Manual search error:', error);
-                manualSearchStatus.textContent = 'A network error occurred during manual search.';
-            } finally {
-                manualSearchButton.disabled = false;
-                manualSearchButton.textContent = 'Search Manually';
+            } else {
+                manualSearchStatus.textContent = 'Please enter an ISBN or both a Title and an Author.';
             }
-        } else {
-            manualSearchStatus.textContent = 'Please enter an ISBN or both a Title and an Author.';
+        } catch (error) {
+            console.error('Manual search error:', error);
+            manualSearchStatus.textContent = 'A network error occurred during manual search.';
+        } finally {
             manualSearchButton.disabled = false;
             manualSearchButton.textContent = 'Search Manually';
+        }
+    }
+
+    // Manual Entry Functions
+    function showManualEntryModal() {
+        // Clear form fields
+        document.getElementById('entry-title').value = '';
+        document.getElementById('entry-author').value = '';
+        document.getElementById('entry-isbn').value = '';
+        document.getElementById('entry-publisher').value = '';
+        document.getElementById('entry-published-date').value = '';
+        manualEntryStatus.textContent = '';
+        
+        // Show modal
+        showModal(manualEntryModal, manualEntryModalContent);
+    }
+
+    async function handleManualEntry(event) {
+        event.preventDefault();
+        
+        const title = document.getElementById('entry-title').value.trim();
+        const author = document.getElementById('entry-author').value.trim();
+        const isbn = document.getElementById('entry-isbn').value.trim();
+        const publisher = document.getElementById('entry-publisher').value.trim();
+        const publishedDate = document.getElementById('entry-published-date').value.trim();
+
+        // Validate required fields
+        if (!title || !author) {
+            manualEntryStatus.textContent = 'Title and Author are required.';
+            return;
+        }
+
+        try {
+            entryGenerateButton.disabled = true;
+            entryGenerateButton.textContent = 'Generating...';
+            manualEntryStatus.textContent = '';
+
+            // Create metadata object from manual entry
+            const metadata = {
+                title: title,
+                author: author,
+                isbn: isbn || null,
+                publisher: publisher || null,
+                publishedDate: publishedDate || null,
+                description: '',
+                coverUrl: null,
+                source: 'Manual Entry'
+            };
+
+            // Send to server for EPUB generation
+            const response = await fetch('', {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    action: 'confirm_epub_creation',
+                    metadata: metadata
+                })
+            });
+
+            const data = await response.json();
+
+            if (data.success) {
+                logResult(`SUCCESS: ${data.message}. File: ${data.filename}`);
+                // Close modal and restart appropriate flow
+                hideModal(manualEntryModal, manualEntryModalContent, null);
+                restartScannerAfterDelay(1500);
+            } else {
+                manualEntryStatus.textContent = data.message || 'Failed to generate EPUB. Please try again.';
+            }
+        } catch (error) {
+            console.error('Manual entry error:', error);
+            manualEntryStatus.textContent = 'A network error occurred. Please try again.';
+        } finally {
+            entryGenerateButton.disabled = false;
+            entryGenerateButton.textContent = 'Generate EPUB';
         }
     }
 
@@ -1793,6 +1950,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
               isBarcodeScanFlow = false;
               showManualSearchModal();
           });
+          mainManualEntryButton.addEventListener('click', () => {
+              isBarcodeScanFlow = false;
+              showManualEntryModal();
+          });
           mainScanCoverButton.addEventListener('click', () => {
               isBarcodeScanFlow = false;
               showCoverScanModal();
@@ -1813,9 +1974,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
               restartScannerAfterDelay(100);
           });
 
-          manualEntryButton.addEventListener('click', () => {
+          confirmationManualEntryButton.addEventListener('click', () => {
               hideModal(confirmationModal, confirmationModalContent, null);
-              showManualSearchModal(currentMetadata.isbn);
+              showManualEntryModal();
           });
 
           searchAgainButton.addEventListener('click', handleSearchAgain);
@@ -1824,6 +1985,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
           manualSearchForm.addEventListener('submit', handleManualSearch);
           manualCancelButton.addEventListener('click', () => {
               hideModal(manualSearchModal, manualSearchModalContent, null);
+              restartScannerAfterDelay(100);
+          });
+
+          // Manual Entry Modal Listeners
+          manualEntryForm.addEventListener('submit', handleManualEntry);
+          entryCancelButton.addEventListener('click', () => {
+              hideModal(manualEntryModal, manualEntryModalContent, null);
               restartScannerAfterDelay(100);
           });
 
